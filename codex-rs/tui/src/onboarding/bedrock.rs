@@ -103,6 +103,13 @@ enum BedrockAction {
 }
 
 impl BedrockState {
+    pub(super) fn needs_user_input(&self) -> bool {
+        !matches!(
+            self.view,
+            BedrockView::Discovering(_) | BedrockView::Configuring(_)
+        )
+    }
+
     pub(super) fn guidance() -> Self {
         Self {
             view: BedrockView::GovCloudWarning(Arc::default()),

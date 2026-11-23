@@ -5,6 +5,7 @@
 //! activity text. The process-wide cache is used for exit, panic, and terminal
 //! handoff cleanup.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::io::IsTerminal;
@@ -26,7 +27,7 @@ static TERMINAL_PROGRAM_STATUS_SUPPORT: OnceLock<TerminalProgramStatusSupport> =
 const MIN_VTE_VERSION_WITH_SAFE_OSC: u32 = 5400;
 
 struct SessionStatusState {
-    last_emitted: Mutex<EmittedSessionStatus>,
+    last_emitted: Mutex<BTreeMap<Option<&'static str>, EmittedSessionStatus>>,
 }
 
 struct EmittedSessionStatus {
@@ -36,26 +37,24 @@ struct EmittedSessionStatus {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CachedStatus {
-    Cleared,
     Reported(ProgramStatus),
     Invalidated,
+    PendingClear,
 }
 
 impl SessionStatusState {
     const fn new() -> Self {
         Self {
-            last_emitted: Mutex::new(EmittedSessionStatus {
-                status: CachedStatus::Cleared,
-                detail: String::new(),
-            }),
+            last_emitted: Mutex::new(BTreeMap::new()),
         }
     }
 
     fn update(
         &self,
-        status: CachedStatus,
+        id: Option<&'static str>,
+        status: Option<ProgramStatus>,
         detail: &str,
-        emit: impl FnOnce() -> io::Result<()>,
+        mut emit: impl FnMut(Option<&'static str>, Option<ProgramStatus>) -> io::Result<()>,
     ) -> io::Result<()> {
         // Keep the terminal write and cache mutation together so panic-hook cleanup cannot
         // interleave with a draw from another thread.
@@ -63,23 +62,60 @@ impl SessionStatusState {
             .last_emitted
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if last_emitted.status == status && last_emitted.detail == detail {
-            return Ok(());
+        // A guard can go away even when its final write fails. The next draw
+        // retries that clear, unless this record is itself being updated.
+        last_emitted.retain(|&other, entry| {
+            other == id || entry.status != CachedStatus::PendingClear || emit(other, None).is_err()
+        });
+        let previous = last_emitted.get(&id);
+        if let Some(status) = status {
+            if previous.is_some_and(|entry| {
+                entry.status == CachedStatus::Reported(status) && entry.detail == detail
+            }) {
+                return Ok(());
+            }
+            emit(id, Some(status))?;
+            last_emitted.insert(
+                id,
+                EmittedSessionStatus {
+                    status: CachedStatus::Reported(status),
+                    detail: detail.to_owned(),
+                },
+            );
+        } else if let Some(entry) = last_emitted.get_mut(&id) {
+            entry.status = CachedStatus::PendingClear;
+            emit(id, None)?;
+            last_emitted.remove(&id);
         }
-        emit()?;
-        last_emitted.status = status;
-        detail.clone_into(&mut last_emitted.detail);
         Ok(())
     }
 
-    fn invalidate(&self) {
-        let mut last_emitted = self
-            .last_emitted
+    // Clear every live child. On handoff keep the root dirty for the next draw.
+    // Retain failed clears for a later retry, and still attempt the other records.
+    fn cleanup(
+        &self,
+        invalidate_root: bool,
+        mut clear: impl FnMut(Option<&'static str>) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut first_error = Ok(());
+        self.last_emitted
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if last_emitted.status != CachedStatus::Cleared {
-            last_emitted.status = CachedStatus::Invalidated;
-        }
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|&id, entry| {
+                if invalidate_root && id.is_none() {
+                    entry.status = CachedStatus::Invalidated;
+                    return true;
+                }
+                if let Err(err) = clear(id) {
+                    entry.status = CachedStatus::PendingClear;
+                    if first_error.is_ok() {
+                        first_error = Err(err);
+                    }
+                    return true;
+                }
+                false
+            });
+        first_error
     }
 }
 
@@ -137,6 +173,14 @@ pub(crate) fn set_terminal_program_status(
     status: ProgramStatus,
     detail: Option<&str>,
 ) -> io::Result<()> {
+    set_record(None, status, detail)
+}
+
+fn set_record(
+    id: Option<&'static str>,
+    status: ProgramStatus,
+    detail: Option<&str>,
+) -> io::Result<()> {
     if cfg!(test) {
         return Ok(());
     }
@@ -146,49 +190,77 @@ pub(crate) fn set_terminal_program_status(
         return Ok(());
     }
 
-    let detail = if support.osc_21337 {
+    let detail = if id.is_none() && support.osc_21337 {
         sanitize_iterm_session_detail(detail.unwrap_or_default())
     } else {
         String::new()
     };
-    SESSION_STATUS_STATE.update(CachedStatus::Reported(status), &detail, || {
-        execute!(
+    SESSION_STATUS_STATE.update(id, Some(status), &detail, |id, status| match status {
+        Some(status) => execute!(
             stdout(),
             SetTerminalProgramStatus {
+                id,
                 status,
                 iterm_detail: &detail,
                 emit_iterm_status: support.osc_21337,
             }
-        )
+        ),
+        None => clear_record(id),
     })
 }
 
 pub(crate) fn clear_terminal_program_status() -> io::Result<()> {
-    if cfg!(test) {
-        return Ok(());
-    }
-
-    let support = current_terminal_program_status_support();
-    if !support.osc_7501 {
-        return Ok(());
-    }
-
-    SESSION_STATUS_STATE.update(CachedStatus::Cleared, "", || {
-        execute!(
-            stdout(),
-            ClearTerminalProgramStatus {
-                emit_iterm_status: support.osc_21337,
-            }
-        )
-    })
+    SESSION_STATUS_STATE.cleanup(false, clear_record)
 }
 
-/// Forgets the cached state after another process has owned the terminal.
-///
-/// The next active draw will re-emit Codex's current status even if its
-/// lifecycle state did not change during the handoff.
+fn clear_record(id: Option<&'static str>) -> io::Result<()> {
+    execute!(
+        stdout(),
+        ClearTerminalProgramStatus {
+            id,
+            emit_iterm_status: current_terminal_program_status_support().osc_21337,
+        }
+    )
+}
+
+/// Clear child records and force the next active draw to re-emit the root status.
 pub(crate) fn invalidate_terminal_program_status() {
-    SESSION_STATUS_STATE.invalidate();
+    if let Err(err) = SESSION_STATUS_STATE.cleanup(true, clear_record) {
+        tracing::debug!(%err, "failed to clear terminal program status after handoff");
+    }
+}
+
+/// Owns the OSC record for the currently visible startup dialog.
+#[derive(Default)]
+pub(crate) struct DialogStatusGuard {
+    id: Option<&'static str>,
+}
+
+impl DialogStatusGuard {
+    pub(crate) fn report(&mut self, id: &'static str, kind: ProgramStatusKind) {
+        if self.id != Some(id) {
+            self.clear();
+            self.id = Some(id);
+        }
+        if let Err(err) = set_record(self.id, ProgramStatus::Blocked(kind), None) {
+            tracing::debug!(%err, id, "failed to set dialog status");
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        if let Some(id) = self.id.take()
+            && let Err(err) =
+                SESSION_STATUS_STATE.update(Some(id), None, "", |id, _| clear_record(id))
+        {
+            tracing::debug!(%err, id, "failed to clear dialog status");
+        }
+    }
+}
+
+impl Drop for DialogStatusGuard {
+    fn drop(&mut self) {
+        self.clear();
+    }
 }
 
 fn sanitize_iterm_session_detail(detail: &str) -> String {
@@ -240,6 +312,7 @@ fn terminal_program_status_support(
 
 #[derive(Clone, Copy, Debug)]
 struct SetTerminalProgramStatus<'a> {
+    id: Option<&'a str>,
     status: ProgramStatus,
     iterm_detail: &'a str,
     emit_iterm_status: bool,
@@ -247,7 +320,7 @@ struct SetTerminalProgramStatus<'a> {
 
 impl Command for SetTerminalProgramStatus<'_> {
     fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        if self.emit_iterm_status {
+        if self.id.is_none() && self.emit_iterm_status {
             write!(
                 f,
                 "\x1b]21337;status={};indicator={};status-color=;detail={}\x07",
@@ -256,11 +329,10 @@ impl Command for SetTerminalProgramStatus<'_> {
                 self.iterm_detail,
             )?;
         }
-        write!(
-            f,
-            "\x1b]7501;state={}:app=codex",
-            self.status.protocol_state()
-        )?;
+        write!(f, "\x1b]7501;state={}", self.status.protocol_state())?;
+        if self.id.is_none() {
+            write!(f, ":app=codex")?;
+        }
         if let ProgramStatus::Blocked(kind) = self.status {
             let kind = match kind {
                 ProgramStatusKind::Permission => "permission",
@@ -268,6 +340,9 @@ impl Command for SetTerminalProgramStatus<'_> {
                 ProgramStatusKind::Auth => "auth",
             };
             write!(f, ":kind={kind}")?;
+        }
+        if let Some(id) = self.id {
+            write!(f, ":id={id}:app=codex")?;
         }
         write!(f, "\x1b\\")
     }
@@ -286,16 +361,21 @@ impl Command for SetTerminalProgramStatus<'_> {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct ClearTerminalProgramStatus {
+struct ClearTerminalProgramStatus<'a> {
+    id: Option<&'a str>,
     emit_iterm_status: bool,
 }
 
-impl Command for ClearTerminalProgramStatus {
+impl Command for ClearTerminalProgramStatus<'_> {
     fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        if self.emit_iterm_status {
+        if self.id.is_none() && self.emit_iterm_status {
             write!(f, "\x1b]21337;status=;indicator=;status-color=;detail=\x07")?;
         }
-        write!(f, "\x1b]7501;state=clear\x1b\\")
+        write!(f, "\x1b]7501;state=clear")?;
+        if let Some(id) = self.id {
+            write!(f, ":id={id}")?;
+        }
+        write!(f, "\x1b\\")
     }
 
     #[cfg(windows)]

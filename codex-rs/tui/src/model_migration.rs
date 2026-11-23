@@ -11,6 +11,8 @@ use crate::render::renderable::FlexRenderable;
 use crate::render::renderable::Renderable;
 use crate::render::renderable::RenderableExt as _;
 use crate::render::renderable::RenderableItem;
+use crate::terminal_program_status::DialogStatusGuard;
+use crate::terminal_program_status::ProgramStatusKind;
 use crate::tui::FrameRequester;
 use crate::tui::Tui;
 use crate::tui::TuiEvent;
@@ -154,7 +156,9 @@ pub(crate) async fn run_model_migration_prompt(
     let events = alt.tui.event_stream();
     tokio::pin!(events);
 
+    let mut dialog_status = DialogStatusGuard::default();
     while !screen.is_done() {
+        dialog_status.report("startup/model-migration", ProgramStatusKind::Question);
         if let Some(event) = events.next().await {
             let _ = alt.tui.screen_size_for_event(&event);
             match event {
