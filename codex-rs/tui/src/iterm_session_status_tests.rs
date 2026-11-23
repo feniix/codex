@@ -7,7 +7,6 @@ use codex_terminal_detection::TerminalName;
 use crossterm::Command;
 use pretty_assertions::assert_eq;
 
-use super::CachedStatus;
 use super::ClearTerminalProgramStatus;
 use super::ProgramStatus;
 use super::ProgramStatusKind;
@@ -31,6 +30,7 @@ fn encodes_iterm_session_status_fields() {
     ] {
         let mut value = String::new();
         SetTerminalProgramStatus {
+            id: None,
             status,
             iterm_detail: detail,
             emit_iterm_status: true,
@@ -52,6 +52,7 @@ fn encodes_iterm_session_status_fields() {
 fn encodes_generic_program_status() {
     let mut encoded = String::new();
     SetTerminalProgramStatus {
+        id: None,
         status: ProgramStatus::Working,
         iterm_detail: "ignored",
         emit_iterm_status: false,
@@ -60,6 +61,30 @@ fn encodes_generic_program_status() {
     .expect("encode generic terminal program status");
 
     assert_eq!(encoded, "\x1b]7501;state=working:app=codex\x1b\\");
+}
+
+#[test]
+fn child_status_and_clear_only_address_the_named_osc_record() {
+    let id = Some("startup/trust");
+    let mut encoded = String::new();
+    SetTerminalProgramStatus {
+        id,
+        status: ProgramStatus::Blocked(ProgramStatusKind::Permission),
+        iterm_detail: "",
+        emit_iterm_status: true,
+    }
+    .write_ansi(&mut encoded)
+    .unwrap();
+    ClearTerminalProgramStatus {
+        id,
+        emit_iterm_status: true,
+    }
+    .write_ansi(&mut encoded)
+    .unwrap();
+    assert_eq!(
+        encoded,
+        "\x1b]7501;state=blocked:kind=permission:id=startup/trust:app=codex\x1b\\\x1b]7501;state=clear:id=startup/trust\x1b\\"
+    );
 }
 
 #[test]
@@ -78,12 +103,14 @@ fn detail_is_safe_bounded_osc_text() {
 fn clear_empties_every_owned_field() {
     let mut combined = String::new();
     ClearTerminalProgramStatus {
+        id: None,
         emit_iterm_status: true,
     }
     .write_ansi(&mut combined)
     .expect("encode combined terminal program status clear");
     let mut generic = String::new();
     ClearTerminalProgramStatus {
+        id: None,
         emit_iterm_status: false,
     }
     .write_ansi(&mut generic)
@@ -100,48 +127,76 @@ fn clear_empties_every_owned_field() {
 fn cache_changes_only_after_a_successful_write() {
     let state = SessionStatusState::new();
     let mut emitted = Vec::new();
-    let working = CachedStatus::Reported(ProgramStatus::Working);
+    let working = Some(ProgramStatus::Working);
     state
-        .update(working, "Thinking", || {
+        .update(None, working, "Thinking", |_, _| {
             Err(io::Error::other("write failed"))
         })
         .expect_err("failed write should be returned");
 
+    let mut record_write = |_, status| {
+        emitted.push(status);
+        Ok(())
+    };
+    for detail in ["Thinking", "Thinking", "Reading"] {
+        state
+            .update(None, working, detail, &mut record_write)
+            .unwrap();
+    }
     state
-        .update(working, "Thinking", || {
-            emitted.push(working);
-            Ok(())
-        })
-        .expect("retry status write");
+        .cleanup(true, |_| panic!("root should only be invalidated"))
+        .unwrap();
     state
-        .update(working, "Thinking", || {
-            emitted.push(CachedStatus::Reported(ProgramStatus::Blocked(
-                ProgramStatusKind::Question,
-            )));
-            Ok(())
-        })
-        .expect("deduplicate status write");
-    state
-        .update(working, "Reading", || {
-            emitted.push(working);
-            Ok(())
-        })
-        .expect("emit changed detail");
-    state.invalidate();
-    state
-        .update(working, "Thinking", || {
-            emitted.push(working);
-            Ok(())
-        })
-        .expect("re-emit status after terminal handoff");
-    state
-        .update(CachedStatus::Cleared, "", || {
-            emitted.push(CachedStatus::Cleared);
-            Ok(())
-        })
-        .expect("clear status");
+        .update(None, working, "Thinking", &mut record_write)
+        .unwrap();
+    state.update(None, None, "", record_write).unwrap();
+    assert_eq!(emitted, [working, working, working, None]);
+}
 
-    assert_eq!(emitted, [working, working, working, CachedStatus::Cleared,]);
+#[test]
+fn cleanup_handles_root_and_children_independently() {
+    let state = SessionStatusState::new();
+    let status = Some(ProgramStatus::Blocked(ProgramStatusKind::Permission));
+    let trust = Some("startup/trust");
+    let hooks = Some("startup/hooks");
+    for id in [None, trust, hooks] {
+        state.update(id, status, "", |_, _| Ok(())).unwrap();
+    }
+    state
+        .update(trust, status, "", |_, _| panic!("duplicate child write"))
+        .unwrap();
+    let mut cleared = Vec::new();
+    state
+        .cleanup(true, |id| {
+            cleared.push(id);
+            if id == hooks {
+                Err(io::Error::other("write failed"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+    assert_eq!(cleared, [hooks, trust]);
+
+    let mut writes = Vec::new();
+    for id in [None, trust] {
+        state
+            .update(id, status, "", |id, status| {
+                writes.push((id, status));
+                Ok(())
+            })
+            .unwrap();
+    }
+    assert_eq!(writes, [(hooks, None), (None, status), (trust, status)]);
+    cleared.clear();
+    state
+        .cleanup(false, |id| {
+            cleared.push(id);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(cleared, [None, trust]);
+    state.cleanup(false, |_| panic!("duplicate clear")).unwrap();
 }
 
 #[test]

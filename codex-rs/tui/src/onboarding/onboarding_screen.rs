@@ -52,6 +52,8 @@ use crate::onboarding::trust_directory::TrustDirectorySelection;
 use crate::onboarding::trust_directory::TrustDirectoryWidget;
 use crate::onboarding::welcome::WelcomeWidget;
 use crate::startup_draft::StartupCancelled;
+use crate::terminal_program_status::DialogStatusGuard;
+use crate::terminal_program_status::ProgramStatusKind;
 use crate::tui::FrameRequester;
 use crate::tui::MouseCapture;
 use crate::tui::Tui;
@@ -302,10 +304,13 @@ impl OnboardingScreen {
 
     /// Check whether the first unfinished onboarding step can grant directory trust.
     fn is_trust_step_active(&self) -> bool {
+        matches!(self.active_step(), Some(Step::TrustDirectory(_)))
+    }
+
+    fn active_step(&self) -> Option<&Step> {
         self.steps
             .iter()
             .find(|step| matches!(step.get_step_state(), StepState::InProgress))
-            .is_some_and(|step| matches!(step, Step::TrustDirectory(_)))
     }
 
     fn cancel_auth_if_active(&self) {
@@ -740,7 +745,20 @@ async fn run_onboarding_screen_inner(
         _ => None,
     };
 
+    let mut dialog_status = DialogStatusGuard::default();
     while !onboarding_screen.is_done() {
+        match onboarding_screen.active_step() {
+            Some(Step::TrustDirectory(_)) => {
+                dialog_status.report("startup/trust", ProgramStatusKind::Permission)
+            }
+            Some(Step::Auth(auth)) if auth.needs_user_input() => {
+                dialog_status.report("startup/login", ProgramStatusKind::Auth)
+            }
+            Some(Step::GatewayDevice(_)) => {
+                dialog_status.report("startup/login", ProgramStatusKind::Auth)
+            }
+            _ => dialog_status.clear(),
+        }
         tokio::select! {
             () = async {
                 match onboarding_screen.auth_widget_mut() {
@@ -795,6 +813,9 @@ async fn run_onboarding_screen_inner(
                                 tui.frame_requester().schedule_frame();
                             } else {
                                 onboarding_screen.handle_key_event(key_event);
+                            }
+                            if !onboarding_screen.is_trust_step_active() && trust_step_was_active {
+                                dialog_status.clear();
                             }
                             if !directory_trust_persisted {
                                 directory_trust_persisted = persist_selected_trust(

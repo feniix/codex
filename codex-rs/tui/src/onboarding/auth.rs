@@ -329,6 +329,34 @@ impl AuthModeWidget {
         self.animations_suppressed.set(suppressed);
     }
 
+    pub(super) fn needs_user_input(&self) -> bool {
+        if let Some(step) = &self.gateway {
+            return matches!(
+                step,
+                GatewayStep::Picking(_) | GatewayStep::Editing { .. } | GatewayStep::LoadError(_)
+            );
+        }
+        match &*self.sign_in_state.read().unwrap() {
+            SignInState::PickMode
+            | SignInState::ChatGptSuccessMessage
+            | SignInState::ApiKeyEntry(_)
+            | SignInState::GatewayOAuthFailed { .. } => true,
+            SignInState::ChatGptContinueInBrowser(state) => !state.auth_url.is_empty(),
+            SignInState::ChatGptDeviceCode(state) => state.is_showing_copyable_auth(),
+            SignInState::Bedrock(state) => state.needs_user_input(),
+            SignInState::Gcp(state) => state.is_text_entry_active(),
+            SignInState::GatewayOAuth { url, .. } => {
+                url.as_ref().is_some_and(|url| !url.is_empty())
+            }
+            SignInState::ChatGptSuccess
+            | SignInState::ApiKeyConfigured
+            | SignInState::BedrockConfigured
+            | SignInState::GcpConfigured
+            | SignInState::GatewaySelected(_)
+            | SignInState::GatewayConfigured => false,
+        }
+    }
+
     pub(crate) fn should_suppress_animations(&self) -> bool {
         matches!(
             &*self.sign_in_state.read().unwrap(),
@@ -1803,6 +1831,25 @@ mod tests {
 
           Press enter to continue
         "###);
+    }
+
+    #[tokio::test]
+    async fn device_login_needs_input_only_when_the_code_is_ready() {
+        let (widget, _tmp) = widget_forced_chatgpt().await;
+        *widget.sign_in_state.write().unwrap() = SignInState::ChatGptDeviceCode(
+            ContinueWithDeviceCodeState::pending("request-1".to_string()),
+        );
+        assert!(!widget.needs_user_input());
+        *widget.sign_in_state.write().unwrap() =
+            SignInState::ChatGptDeviceCode(ContinueWithDeviceCodeState::ready(
+                "request-1".to_string(),
+                "login-1".to_string(),
+                "https://chatgpt.com/device".to_string(),
+                "ABCD-EFGH".to_string(),
+            ));
+        assert!(widget.needs_user_input());
+        *widget.sign_in_state.write().unwrap() = SignInState::ChatGptSuccess;
+        assert!(!widget.needs_user_input());
     }
 
     #[test]
